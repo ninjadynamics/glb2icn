@@ -10,8 +10,8 @@
  *   header(20) | vertices(count*24) | anim(20+16+8) | texture(128*128*2)
  *
  * Build:  make            (see Makefile / README for cgltf + stb paths)
- * Usage:  ./glb2icn input.glb [output.icn] [--scale F] [--flipy] [--noflipy]
- *                              [--rgba R G B A]
+ * Usage:  ./glb2icn [input.glb] [output.icn] [--cube|--flat] [--tex img]
+ *                   [--scale F] [--flipy] [--noflipy] [--stretch] [--rgba R G B A]
  */
 
 #include <stdio.h>
@@ -29,7 +29,8 @@
 
 #define ICN_TEX_DIM   128
 #define ICN_FIX       4096.0f          /* fixed-point 1.0 */
-#define ICN_VERT_MAX  12000            /* soft cap; BIOS slows/chokes past a few thousand */
+#define ICN_VERT_MAX  1800             /* guardrail: a 4374-vert mesh was rejected by the
+                                          BIOS as "Corrupted Data"; keep icons tiny (--flat) */
 
 /* ---- little-endian output buffer ------------------------------------- */
 typedef struct { uint8_t *p; size_t len, cap; } Buf;
@@ -114,6 +115,7 @@ static void process_node(const cgltf_node *n){
 
 /* ---- texture: first material's base-color image -> 128x128 BGR555 ----- */
 static const cgltf_image *find_base_image(const cgltf_data *d){
+    if (!d) return NULL;
     for (cgltf_size m=0;m<d->materials_count;m++){
         const cgltf_material *mat=&d->materials[m];
         if (mat->has_pbr_metallic_roughness &&
@@ -124,25 +126,58 @@ static const cgltf_image *find_base_image(const cgltf_data *d){
     return d->images_count ? &d->images[0] : NULL;
 }
 
-static void write_texture(Buf *b, const cgltf_data *d, const uint8_t fallback[4]){
-    unsigned char *rgba = NULL;     /* 128x128x4 */
-    const cgltf_image *img = find_base_image(d);
-    if (img && img->buffer_view){
-        const cgltf_buffer_view *bv = img->buffer_view;
-        const uint8_t *bytes = (const uint8_t*)bv->buffer->data + bv->offset;
-        int w,h,n; unsigned char *src = stbi_load_from_memory(bytes,(int)bv->size,&w,&h,&n,4);
-        if (src){
-            rgba = malloc(ICN_TEX_DIM*ICN_TEX_DIM*4);
-            stbir_resize_uint8_linear(src,w,h,0, rgba,ICN_TEX_DIM,ICN_TEX_DIM,0, STBIR_RGBA);
-            stbi_image_free(src);
-            fprintf(stderr,"glb2icn: texture %dx%d -> 128x128\n",w,h);
+/* The icon texture is a FIXED 128x128. To keep a non-square source's aspect
+   ratio we letterbox: scale to fit inside 128x128, center it, and fill the
+   margins with `pad`. `stretch` restores the old fill-the-square behavior. */
+static void write_texture(Buf *b, const cgltf_data *d, const char *texfile, const uint8_t pad[4], int stretch){
+    unsigned char *rgba = malloc(ICN_TEX_DIM*ICN_TEX_DIM*4);   /* 128x128x4 */
+    for (int i=0;i<ICN_TEX_DIM*ICN_TEX_DIM;i++) memcpy(&rgba[i*4],pad,4);
+
+    unsigned char *src = NULL; int w=0,h=0,n=0;
+    if (texfile){                                 /* --tex: standalone image file */
+        src = stbi_load(texfile,&w,&h,&n,4);
+        if (!src) fprintf(stderr,"glb2icn: cannot load --tex %s\n",texfile);
+    } else {
+        const cgltf_image *img = find_base_image(d);
+        if (img && img->buffer_view){
+            const cgltf_buffer_view *bv = img->buffer_view;
+            const uint8_t *bytes = (const uint8_t*)bv->buffer->data + bv->offset;
+            src = stbi_load_from_memory(bytes,(int)bv->size,&w,&h,&n,4);
         }
     }
-    if (!rgba){
-        rgba = malloc(ICN_TEX_DIM*ICN_TEX_DIM*4);
-        for (int i=0;i<ICN_TEX_DIM*ICN_TEX_DIM;i++) memcpy(&rgba[i*4],fallback,4);
-        fprintf(stderr,"glb2icn: no base-color texture; using solid fallback color\n");
+    if (src){
+        int fw=ICN_TEX_DIM, fh=ICN_TEX_DIM;
+        if (!stretch && w>0 && h>0){                  /* fit preserving aspect ratio */
+            double sw=(double)ICN_TEX_DIM/w, sh=(double)ICN_TEX_DIM/h, s=(sw<sh)?sw:sh;
+            fw=(int)(w*s+0.5); if(fw<1)fw=1; else if(fw>ICN_TEX_DIM)fw=ICN_TEX_DIM;
+            fh=(int)(h*s+0.5); if(fh<1)fh=1; else if(fh>ICN_TEX_DIM)fh=ICN_TEX_DIM;
+        }
+        unsigned char *fit = malloc((size_t)fw*fh*4);
+        stbir_resize_uint8_linear(src,w,h,0, fit,fw,fh,0, STBIR_RGBA);
+        int ox=(ICN_TEX_DIM-fw)/2, oy=(ICN_TEX_DIM-fh)/2;     /* center */
+        for (int y=0;y<fh;y++)
+            memcpy(&rgba[((size_t)(oy+y)*ICN_TEX_DIM+ox)*4], &fit[(size_t)y*fw*4], (size_t)fw*4);
+        free(fit); stbi_image_free(src);
+        fprintf(stderr,"glb2icn: texture %dx%d -> %dx%d %s in 128x128\n",
+                w,h,fw,fh, stretch?"(stretched)":"(letterboxed)");
+    } else {
+        fprintf(stderr,"glb2icn: no texture source; using solid pad color\n");
     }
+    /* The PS2 icon samples bottom-up relative to our row order (renders
+       upside-down), and faces are wound so the front view mirrors U
+       (renders flipped left-right) -- so flip both axes. */
+    for (int y=0;y<ICN_TEX_DIM/2;y++){
+        uint8_t tmp[ICN_TEX_DIM*4];
+        uint8_t *ra=&rgba[(size_t)y*ICN_TEX_DIM*4];
+        uint8_t *rb=&rgba[(size_t)(ICN_TEX_DIM-1-y)*ICN_TEX_DIM*4];
+        memcpy(tmp,ra,sizeof(tmp)); memcpy(ra,rb,sizeof(tmp)); memcpy(rb,tmp,sizeof(tmp));
+    }
+    for (int y=0;y<ICN_TEX_DIM;y++)
+        for (int x=0;x<ICN_TEX_DIM/2;x++){
+            uint8_t *pa=&rgba[((size_t)y*ICN_TEX_DIM+x)*4];
+            uint8_t *pb=&rgba[((size_t)y*ICN_TEX_DIM+(ICN_TEX_DIM-1-x))*4];
+            for (int k=0;k<4;k++){ uint8_t t=pa[k]; pa[k]=pb[k]; pb[k]=t; }
+        }
     for (int i=0;i<ICN_TEX_DIM*ICN_TEX_DIM;i++){
         int r=rgba[i*4]>>3, g=rgba[i*4+1]>>3, bl=rgba[i*4+2]>>3;
         w16(b,(bl<<10)|(g<<5)|r);     /* BGR555 (X=0) */
@@ -154,27 +189,81 @@ int main(int argc, char **argv){
     const char *in=NULL,*out=NULL; char outbuf[1024];
     float scale_arg=0.f;            /* 0 = auto-fit */
     int flipy=1;                    /* glTF +Y up; PS2 browser shows it upright with Y negated */
-    uint8_t fb[4]={255,255,255,255};
+    int flipy_set=0;                /* did the user pass --flipy/--noflipy? */
+    int stretch=0;                  /* default: letterbox the texture (keep its AR) */
+    int flat=0;                     /* --flat: ignore mesh, emit a textured card */
+    int cube=0;                     /* --cube: ignore mesh, emit a textured cube */
+    float aspectx=1.f;              /* --aspect: extra X stretch to counter display PAR */
+    float yoff=0.f;                 /* --yoff: lift the model to the BIOS zoom pivot */
+    const char *texfile=NULL;       /* --tex: texture from a standalone image file */
+    uint8_t pad[4]={0,0,0,255};     /* letterbox margin / no-texture fill color */
     for (int i=1;i<argc;i++){
         if (!strcmp(argv[i],"--scale") && i+1<argc) scale_arg=(float)atof(argv[++i]);
-        else if (!strcmp(argv[i],"--flipy"))   flipy=1;
-        else if (!strcmp(argv[i],"--noflipy")) flipy=0;
-        else if (!strcmp(argv[i],"--rgba") && i+4<argc){ fb[0]=atoi(argv[i+1]);fb[1]=atoi(argv[i+2]);fb[2]=atoi(argv[i+3]);fb[3]=atoi(argv[i+4]); i+=4; }
+        else if (!strcmp(argv[i],"--flipy"))   { flipy=1; flipy_set=1; }
+        else if (!strcmp(argv[i],"--noflipy")) { flipy=0; flipy_set=1; }
+        else if (!strcmp(argv[i],"--stretch")) stretch=1;
+        else if (!strcmp(argv[i],"--flat"))    flat=1;
+        else if (!strcmp(argv[i],"--cube"))    cube=1;
+        else if (!strcmp(argv[i],"--aspect") && i+1<argc) aspectx=(float)atof(argv[++i]);
+        else if (!strcmp(argv[i],"--yoff")   && i+1<argc) yoff=(float)atof(argv[++i]);
+        else if (!strcmp(argv[i],"--tex") && i+1<argc) texfile=argv[++i];
+        else if (!strcmp(argv[i],"--rgba") && i+4<argc){ pad[0]=atoi(argv[i+1]);pad[1]=atoi(argv[i+2]);pad[2]=atoi(argv[i+3]);pad[3]=atoi(argv[i+4]); i+=4; }
         else if (argv[i][0]=='-'){ fprintf(stderr,"glb2icn: unknown option %s\n",argv[i]); return 2; }
         else if (!in) in=argv[i];
         else if (!out) out=argv[i];
     }
-    if (!in){ fprintf(stderr,"usage: glb2icn input.glb [output.icn] [--scale F] [--noflipy] [--rgba R G B A]\n"); return 2; }
+    /* --cube/--flat + --tex need no GLB: the first positional becomes the output. */
+    if ((cube||flat) && texfile && !out && in){ out=in; in=NULL; }
+    if (!in && !texfile){ fprintf(stderr,"usage: glb2icn input.glb [output.icn] [--flat|--cube] [--tex img] [--scale F] [--noflipy] [--stretch] [--rgba R G B A]\n"); return 2; }
+    if ((flat||cube) && !flipy_set) flipy=0;   /* authored in icon space already */
     if (!out){ snprintf(outbuf,sizeof(outbuf),"%s",in); char*dot=strrchr(outbuf,'.'); if(dot)strcpy(dot,".icn"); else strcat(outbuf,".icn"); out=outbuf; }
 
     cgltf_options opt={0}; cgltf_data *d=NULL;
-    if (cgltf_parse_file(&opt,in,&d)!=cgltf_result_success){ fprintf(stderr,"glb2icn: parse failed: %s\n",in); return 1; }
-    if (cgltf_load_buffers(&opt,d,in)!=cgltf_result_success){ fprintf(stderr,"glb2icn: load buffers failed\n"); cgltf_free(d); return 1; }
+    if (in){
+        if (cgltf_parse_file(&opt,in,&d)!=cgltf_result_success){ fprintf(stderr,"glb2icn: parse failed: %s\n",in); return 1; }
+        if (cgltf_load_buffers(&opt,d,in)!=cgltf_result_success){ fprintf(stderr,"glb2icn: load buffers failed\n"); cgltf_free(d); return 1; }
+    }
 
-    for (cgltf_size i=0;i<d->nodes_count;i++) process_node(&d->nodes[i]);
+    if (cube){
+        /* A textured cube (36 verts): every face shows the full image. Icons
+           can't hold a real model (the BIOS rejects large ones as "Corrupted
+           Data"), so this is the simple recognizable shape. */
+        static const float qt[4][2]={{0, 0},{1, 0},{1, 1},{0, 1}};   /* TL TR BR BL */
+        static const int   tri[6]={0,2,1, 0,3,2};   /* CCW seen from outside */
+        static const float faces[6][4][3]={
+            {{-1, 1, 1},{ 1, 1, 1},{ 1,-1, 1},{-1,-1, 1}},   /* +Z */
+            {{ 1, 1,-1},{-1, 1,-1},{-1,-1,-1},{ 1,-1,-1}},   /* -Z */
+            {{ 1, 1, 1},{ 1, 1,-1},{ 1,-1,-1},{ 1,-1, 1}},   /* +X */
+            {{-1, 1,-1},{-1, 1, 1},{-1,-1, 1},{-1,-1,-1}},   /* -X */
+            {{-1, 1,-1},{ 1, 1,-1},{ 1, 1, 1},{-1, 1, 1}},   /* +Y */
+            {{-1,-1, 1},{ 1,-1, 1},{ 1,-1,-1},{-1,-1,-1}},   /* -Y */
+        };
+        static const float fn[6][3]={{0,0,1},{0,0,-1},{1,0,0},{-1,0,0},{0,1,0},{0,-1,0}};
+        for (int fi=0;fi<6;fi++)
+            for (int k=0;k<6;k++){ int i=tri[k];
+                Vtx v={faces[fi][i][0],faces[fi][i][1],faces[fi][i][2],
+                       fn[fi][0],fn[fi][1],fn[fi][2], qt[i][0],qt[i][1]};
+                push_vtx(v); }
+    } else if (flat){
+        /* A double-sided textured card (12 verts). The icon texture carries the
+           image; the mesh is trivial. Authored in icon space. */
+        static const float qp[4][2]={{-1, 1},{1, 1},{1,-1},{-1,-1}};  /* TL TR BR BL */
+        static const float qt[4][2]={{0, 0},{1, 0},{1, 1},{0, 1}};
+        static const int   fA[6]={0,1,2, 0,2,3};   /* front  (+Z) */
+        static const int   fB[6]={0,3,2, 0,2,1};   /* back   (-Z), reversed */
+        for (int k=0;k<6;k++){ int i=fA[k]; Vtx v={qp[i][0],qp[i][1],0, 0,0, 1, qt[i][0],qt[i][1]}; push_vtx(v); }
+        for (int k=0;k<6;k++){ int i=fB[k]; Vtx v={qp[i][0],qp[i][1],0, 0,0,-1, qt[i][0],qt[i][1]}; push_vtx(v); }
+    } else {
+        for (cgltf_size i=0;i<d->nodes_count;i++) process_node(&d->nodes[i]);
+    }
     if (g_vn==0){ fprintf(stderr,"glb2icn: no triangle geometry found\n"); cgltf_free(d); return 1; }
     if (g_vn % 3){ fprintf(stderr,"glb2icn: vertex count %zu not a multiple of 3\n",g_vn); cgltf_free(d); return 1; }
-    if (g_vn > ICN_VERT_MAX) fprintf(stderr,"glb2icn: WARNING %zu verts (> %d); BIOS may render slowly. Simplify the model.\n",g_vn,ICN_VERT_MAX);
+    if (g_vn > ICN_VERT_MAX){
+        fprintf(stderr,"glb2icn: ERROR %zu verts (> %d) -- the PS2 BIOS rejects large icons as\n"
+                       "         \"Corrupted Data\". Use --flat to emit a textured card instead.\n",
+                g_vn, ICN_VERT_MAX);
+        cgltf_free(d); return 1;
+    }
 
     /* center + auto-fit to the unit icon view (longest axis -> ~+/-1.0) */
     float mn[3]={1e30f,1e30f,1e30f}, mx[3]={-1e30f,-1e30f,-1e30f};
@@ -192,9 +281,10 @@ int main(int argc, char **argv){
     w32(&b,(uint32_t)g_vn);/* vertex_count */
     for (size_t i=0;i<g_vn;i++){
         Vtx*v=&g_v[i];
-        float px=(v->x-c[0])*s, py=(v->y-c[1])*s, pz=(v->z-c[2])*s;
+        float px=(v->x-c[0])*s*aspectx, py=(v->y-c[1])*s, pz=(v->z-c[2])*s;
         float ny=v->ny;
         if (flipy){ py=-py; ny=-ny; }
+        py += yoff;                  /* shift onto the BIOS camera target (see README) */
         w16(&b,clamp_s16(px*ICN_FIX)); w16(&b,clamp_s16(py*ICN_FIX)); w16(&b,clamp_s16(pz*ICN_FIX)); w16(&b,0);
         w16(&b,clamp_s16(v->nx*ICN_FIX)); w16(&b,clamp_s16(ny*ICN_FIX)); w16(&b,clamp_s16(v->nz*ICN_FIX)); w16(&b,0);
         w16(&b,clamp_s16(v->u*ICN_FIX)); w16(&b,clamp_s16(v->v*ICN_FIX));
@@ -204,7 +294,7 @@ int main(int argc, char **argv){
     w32(&b,0x01); w32(&b,1); wf(&b,1.0f); w32(&b,0); w32(&b,1);
     w32(&b,0); w32(&b,1); w32(&b,0); w32(&b,0);
     wf(&b,0.0f); wf(&b,0.0f);
-    write_texture(&b,d,fb);
+    write_texture(&b,d,texfile,pad,stretch);
 
     FILE *f=fopen(out,"wb");
     if (!f){ fprintf(stderr,"glb2icn: cannot write %s\n",out); cgltf_free(d); return 1; }
