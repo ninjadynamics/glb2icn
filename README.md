@@ -94,12 +94,12 @@ Example:
 - **The PS2 BIOS rejects large icon meshes as "Corrupted Data."** A ~4.4k-vertex
   logo failed; a 36-vertex cube was fine. So a real model usually can't be an icon
   as-is — convert it with `--flat` (a 12-vertex textured card carrying the image),
-  which is what the SuperSolar build uses. Converting the raw mesh errors out past
+  which is what the HyperSolar build uses. Converting the raw mesh errors out past
   `ICN_VERT_MAX` (1800) with a pointer to `--flat`.
 
 ## Wiring it into the game
 
-This is already wired in the SuperSolar build:
+This is already wired in the HyperSolar build:
 1. The `Makefile` builds this tool, then runs `glb2icn --cube --tex
    assets/ps2/icon.png build/ps2/logo.icn` and `incbin`s the result
    (`.balign 64` for DMA) as `logo_icn[]`.
