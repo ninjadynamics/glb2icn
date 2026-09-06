@@ -216,7 +216,18 @@ int main(int argc, char **argv){
     if ((cube||flat) && texfile && !out && in){ out=in; in=NULL; }
     if (!in && !texfile){ fprintf(stderr,"usage: glb2icn input.glb [output.icn] [--flat|--cube] [--tex img] [--scale F] [--noflipy] [--stretch] [--rgba R G B A]\n"); return 2; }
     if ((flat||cube) && !flipy_set) flipy=0;   /* authored in icon space already */
-    if (!out){ snprintf(outbuf,sizeof(outbuf),"%s",in); char*dot=strrchr(outbuf,'.'); if(dot)strcpy(dot,".icn"); else strcat(outbuf,".icn"); out=outbuf; }
+    if (!out){
+        if (!in){ fprintf(stderr,"glb2icn: an output path is required\n"); return 2; }
+        const char *base=in;
+        for (const char *p=in; *p; ++p) if (*p=='/' || *p=='\\') base=p+1;
+        const char *dot=strrchr(base,'.');
+        size_t stem=dot ? (size_t)(dot-in) : strlen(in);
+        const char suffix[]=".icn";
+        if (stem > sizeof(outbuf)-sizeof(suffix)){
+            fprintf(stderr,"glb2icn: output path is too long\n"); return 2;
+        }
+        memcpy(outbuf,in,stem); memcpy(outbuf+stem,suffix,sizeof(suffix)); out=outbuf;
+    }
 
     cgltf_options opt={0}; cgltf_data *d=NULL;
     if (in){
@@ -297,8 +308,14 @@ int main(int argc, char **argv){
     write_texture(&b,d,texfile,pad,stretch);
 
     FILE *f=fopen(out,"wb");
-    if (!f){ fprintf(stderr,"glb2icn: cannot write %s\n",out); cgltf_free(d); return 1; }
-    fwrite(b.p,1,b.len,f); fclose(f);
+    if (!f){ fprintf(stderr,"glb2icn: cannot write %s\n",out); free(b.p); free(g_v); cgltf_free(d); return 1; }
+    int write_ok=fwrite(b.p,1,b.len,f)==b.len;
+    if (fclose(f)!=0) write_ok=0;
+    if (!write_ok){
+        fprintf(stderr,"glb2icn: failed writing %s\n",out);
+        if (remove(out)!=0) fprintf(stderr,"glb2icn: could not remove incomplete output %s\n",out);
+        free(b.p); free(g_v); cgltf_free(d); return 1;
+    }
     fprintf(stderr,"glb2icn: wrote %s (%zu verts, %zu bytes)\n",out,g_vn,b.len);
 
     free(b.p); free(g_v); cgltf_free(d);
