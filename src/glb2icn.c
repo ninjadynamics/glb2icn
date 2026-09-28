@@ -32,14 +32,17 @@
 #define ICN_VERT_MAX  1800             /* guardrail: a 4374-vert mesh was rejected by the
                                           BIOS as "Corrupted Data"; keep icons tiny (--flat) */
 
+/* Input and allocation failures end the conversion before any output exists. */
+static void fail(const char *why) { fprintf(stderr, "glb2icn: %s\n", why); exit(1); }
+static void *need(void *p) { if (!p) fail("out of memory"); return p; }
+
 /* ---- little-endian output buffer ------------------------------------- */
 typedef struct { uint8_t *p; size_t len, cap; } Buf;
 
 static void buf_need(Buf *b, size_t n) {
     if (b->len + n > b->cap) {
         b->cap = (b->len + n) * 2 + 4096;
-        b->p = (uint8_t *)realloc(b->p, b->cap);
-        if (!b->p) { fprintf(stderr, "glb2icn: out of memory\n"); exit(1); }
+        b->p = (uint8_t *)need(realloc(b->p, b->cap));
     }
 }
 static void w8 (Buf *b, unsigned v){ buf_need(b,1); b->p[b->len++]=(uint8_t)v; }
@@ -56,7 +59,7 @@ static Vtx  *g_v   = NULL;
 static size_t g_vn = 0, g_vcap = 0;
 
 static void push_vtx(Vtx v){
-    if (g_vn == g_vcap){ g_vcap = g_vcap? g_vcap*2 : 4096; g_v = realloc(g_v, g_vcap*sizeof(Vtx)); }
+    if (g_vn == g_vcap){ g_vcap = g_vcap? g_vcap*2 : 4096; g_v = need(realloc(g_v, g_vcap*sizeof(Vtx))); }
     g_v[g_vn++] = v;
 }
 
@@ -72,9 +75,13 @@ static void xform_vec(const float *m, const float *in, float *out){
     out[2]=m[2]*in[0]+m[6]*in[1]+m[10]*in[2];
 }
 
-static float *read_floats(const cgltf_accessor *a, int comps){
-    float *o = malloc(a->count*comps*sizeof(float));
-    for (cgltf_size i=0;i<a->count;i++) cgltf_accessor_read_float(a,i,&o[i*comps],comps);
+/* Reads `count` elements of an accessor that must be exactly `type`. */
+static float *read_floats(const cgltf_accessor *a, cgltf_size count, cgltf_type type, int comps){
+    if (a->type != type) fail("unsupported position/normal/texcoord accessor type");
+    if (a->count < count) fail("attribute accessor is shorter than the positions");
+    float *o = need(malloc((count ? count : 1)*comps*sizeof(float)));
+    for (cgltf_size i=0;i<count;i++)
+        if (!cgltf_accessor_read_float(a,i,&o[i*comps],comps)) fail("cannot read an attribute accessor");
     return o;
 }
 
@@ -92,12 +99,13 @@ static void process_node(const cgltf_node *n){
             else if (t==cgltf_attribute_type_texcoord && !ta) ta=pr->attributes[i].data;
         }
         if (!pa) continue;
-        float *pos = read_floats(pa,3);
-        float *nor = na? read_floats(na,3):NULL;
-        float *uv  = ta? read_floats(ta,2):NULL;
+        float *pos = read_floats(pa,pa->count,cgltf_type_vec3,3);
+        float *nor = na? read_floats(na,pa->count,cgltf_type_vec3,3):NULL;
+        float *uv  = ta? read_floats(ta,pa->count,cgltf_type_vec2,2):NULL;
         cgltf_size icount = pr->indices ? pr->indices->count : pa->count;
         for (cgltf_size k=0;k<icount;k++){
             cgltf_size vi = pr->indices ? cgltf_accessor_read_index(pr->indices,k) : k;
+            if (vi >= pa->count) fail("index outside the primitive's vertices");
             float ip[3]={pos[vi*3],pos[vi*3+1],pos[vi*3+2]}, op[3];
             xform_pt(w,ip,op);
             float on[3]={0,0,1};
@@ -130,7 +138,7 @@ static const cgltf_image *find_base_image(const cgltf_data *d){
    ratio we letterbox: scale to fit inside 128x128, center it, and fill the
    margins with `pad`. `stretch` restores the old fill-the-square behavior. */
 static void write_texture(Buf *b, const cgltf_data *d, const char *texfile, const uint8_t pad[4], int stretch){
-    unsigned char *rgba = malloc(ICN_TEX_DIM*ICN_TEX_DIM*4);   /* 128x128x4 */
+    unsigned char *rgba = need(malloc(ICN_TEX_DIM*ICN_TEX_DIM*4));   /* 128x128x4 */
     for (int i=0;i<ICN_TEX_DIM*ICN_TEX_DIM;i++) memcpy(&rgba[i*4],pad,4);
 
     unsigned char *src = NULL; int w=0,h=0,n=0;
@@ -152,8 +160,8 @@ static void write_texture(Buf *b, const cgltf_data *d, const char *texfile, cons
             fw=(int)(w*s+0.5); if(fw<1)fw=1; else if(fw>ICN_TEX_DIM)fw=ICN_TEX_DIM;
             fh=(int)(h*s+0.5); if(fh<1)fh=1; else if(fh>ICN_TEX_DIM)fh=ICN_TEX_DIM;
         }
-        unsigned char *fit = malloc((size_t)fw*fh*4);
-        stbir_resize_uint8_linear(src,w,h,0, fit,fw,fh,0, STBIR_RGBA);
+        unsigned char *fit = need(malloc((size_t)fw*fh*4));
+        if (!stbir_resize_uint8_linear(src,w,h,0, fit,fw,fh,0, STBIR_RGBA)) fail("texture resize failed");
         int ox=(ICN_TEX_DIM-fw)/2, oy=(ICN_TEX_DIM-fh)/2;     /* center */
         for (int y=0;y<fh;y++)
             memcpy(&rgba[((size_t)(oy+y)*ICN_TEX_DIM+ox)*4], &fit[(size_t)y*fw*4], (size_t)fw*4);
@@ -233,6 +241,7 @@ int main(int argc, char **argv){
     if (in){
         if (cgltf_parse_file(&opt,in,&d)!=cgltf_result_success){ fprintf(stderr,"glb2icn: parse failed: %s\n",in); return 1; }
         if (cgltf_load_buffers(&opt,d,in)!=cgltf_result_success){ fprintf(stderr,"glb2icn: load buffers failed\n"); cgltf_free(d); return 1; }
+        if (cgltf_validate(d)!=cgltf_result_success){ fprintf(stderr,"glb2icn: invalid glTF: %s\n",in); cgltf_free(d); return 1; }
     }
 
     if (cube){
